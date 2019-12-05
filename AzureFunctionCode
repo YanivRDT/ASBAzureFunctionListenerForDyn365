@@ -1,0 +1,111 @@
+#r "Newtonsoft.Json"
+using System;
+using System.Text;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System.Threading.Tasks;
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
+using System.Net.Http.Headers;
+
+public static async Task<Guid> Run(string myQueueItem, TraceWriter log)
+{
+    log.Info($"C# ServiceBus queue trigger function processed message: {myQueueItem}");
+
+    //deserialize input message to Account object 
+    Account account = JsonConvert.DeserializeObject<Account>(myQueueItem);   
+
+    //set DYN365 Web API access details 
+    AccessDetails accessDetails = new AccessDetails
+    {
+        ApplicationId = "<REPLACE WITH YOUR APPLICATION ID>",
+        Secret = "<REPLACE WITH YOUR SECRET>",
+        WebAPIURL = "https://XXX.api.crmX.dynamics.com/api/data/v9.1/"
+    };             
+
+    //get access token 
+    string token = GetWebAPIAccessToken(accessDetails);
+
+    log.Info($"toekn: {token}");
+
+    //create account record in Dynamics 365 
+    Guid id = await CreateDYN365Account(account, accessDetails, token);        
+
+    log.Info($"id: {id.ToString()}");
+
+    return id;
+}
+
+// Get Web API access token 
+private static string GetWebAPIAccessToken(AccessDetails accessDetails)
+{
+    string result = string.Empty;
+    string webAPIURL = accessDetails.WebAPIURL;
+
+    AuthenticationParameters ap = AuthenticationParameters.CreateFromResourceUrlAsync(new Uri(webAPIURL)).Result;
+    AuthenticationContext authContext = new AuthenticationContext(ap.Authority);
+    var credentials = new ClientCredential(accessDetails.ApplicationId, accessDetails.Secret);
+    result = authContext.AcquireTokenAsync(ap.Resource, credentials).Result.AccessToken;
+
+    return result;
+}
+
+// Create Dynamics 365 Lead record using access details and access token 
+private static async Task<Guid> CreateDYN365Account(Account account, AccessDetails accessDetails, string accessToken)
+{
+    Guid result = Guid.Empty;
+
+    //convert lead to JObject 
+    JObject accountObj = JObject.FromObject(account);
+
+    //set channel & headers 
+    using (var client = new HttpClient())
+    {
+        client.BaseAddress = new Uri(accessDetails.WebAPIURL);
+        client.Timeout = new TimeSpan(0, 2, 0);
+        client.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
+        client.DefaultRequestHeaders.Add("OData-Version", "4.0");
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                
+        //set Create request and content 
+        HttpRequestMessage createRequest = new HttpRequestMessage(HttpMethod.Post, "accounts")
+        {
+            Content = new StringContent(accountObj.ToString(), Encoding.UTF8, "application/json")
+        };
+
+        HttpResponseMessage createResponse = await client.SendAsync(createRequest);
+
+        try
+        {
+            //verify successful call 
+            createResponse.EnsureSuccessStatusCode();
+
+            //get result content 
+            string leadURL = createResponse.Headers.GetValues("OData-EntityId").FirstOrDefault();
+
+            //extract GUID from URL
+            result = Guid.Parse(Regex.Match(leadURL, @"\(([^)]*)\)").Groups[1].Value);
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"Something is wrong: {ex.Message}");
+        }
+        return result;
+    }
+}
+
+// represents Account record data
+internal class Account
+{            
+    internal string name { get; set; }
+    internal string websiteurl { get; set; }
+    internal int numberofemployees { get; set; }
+}
+
+internal class AccessDetails
+{
+    internal string WebAPIURL { get; set; }
+    internal string ApplicationId { get; set; }
+    internal string Secret { get; set; }
+}
